@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts
+!bin/deploy-setup.js
+.deploy-setup-cache.json
+test-config.json

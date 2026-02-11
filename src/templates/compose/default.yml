@@ -1,0 +1,21 @@
+services:
+  {{APP_NAME}}:
+    image: {{REGISTRY}}/{{GITHUB_USER}}/{{APP_NAME}}:latest
+    container_name: {{APP_NAME}}
+    restart: unless-stopped
+    ports:
+      - "{{APP_PORT}}:{{APP_PORT}}"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - {{APP_NAME}}-data:/app/data
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  {{APP_NAME}}-data:

@@ -1,0 +1,35 @@
+{
+  "name": "deploy-setup",
+  "version": "1.0.0",
+  "description": "通用 CI/CD 配置生成工具 - git push 即部署到 Linux VPS",
+  "main": "dist/cli.js",
+  "bin": {
+    "deploy-setup": "./bin/deploy-setup.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js"
+  },
+  "keywords": [
+    "cicd",
+    "deploy",
+    "github-actions",
+    "docker",
+    "vps"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^11.1.0",
+    "inquirer": "^8.2.6",
+    "ora": "^5.4.1",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^8.2.10",
+    "@types/node": "^20.11.0",
+    "@types/ssh2": "^1.15.5",
+    "typescript": "^5.3.3"
+  }
+}
