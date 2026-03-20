@@ -5,60 +5,53 @@ on:
     branches:
       - {{BRANCH_PRODUCTION}}
 
-env:
-  REGISTRY: ghcr.io
-
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set image name (lowercase)
-        run: echo "IMAGE_NAME=$(echo '${{ github.repository_owner }}/{{APP_NAME}}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-      - name: Copy files to server
+      - name: Copy source to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "docker-compose.yml"
+          source: "."
           target: "{{DEPLOY_DIR}}/{{APP_NAME}}"
+          rm: true
+          overwrite: true
 
-      - name: Deploy to VPS
+      - name: Build and deploy
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            export GITHUB_USER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
             cd {{DEPLOY_DIR}}/{{APP_NAME}}
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker compose pull
+            # Generate .env
+            cat > .env << 'ENVEOF'
+{{ENV_HARDCODED_LINES}}
+            ENVEOF
+            sed -i 's/^ *//' .env
+{{ENV_SECRET_LINES}}
+{{#IF SKIP_BUILD}}
+            # Using existing docker-compose.yml, skip build
             docker compose up -d --remove-orphans
+{{/IF}}
+{{#IF NOT_SKIP_BUILD}}
+            docker compose build
+            docker compose up -d --remove-orphans
+{{/IF}}
+{{#IF DB_MIGRATE_CMD}}
+            echo "Running database migration..."
+            docker compose exec -T {{APP_NAME}} {{DB_MIGRATE_CMD}}
+{{/IF}}
             docker image prune -f
 
       - name: Health check

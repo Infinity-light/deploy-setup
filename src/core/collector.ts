@@ -1,7 +1,9 @@
 import inquirer from 'inquirer';
 import chalk from 'chalk';
-import { DetectionResult, ProjectType, CollectedConfig, Language, ServerConfig, PROJECT_DEFAULTS } from './types';
+import { DetectionResult, ProjectType, CollectedConfig, Language, ServerConfig, FRAMEWORK_PROFILES } from './types';
 import { getSavedServers, saveServer } from '../utils/config-store';
+import { execSync } from 'child_process';
+import * as os from 'os';
 
 const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
   flask: 'Flask',
@@ -12,33 +14,86 @@ const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
   nuxtjs: 'Nuxt.js',
   'vue-spa': 'Vue SPA',
   'react-spa': 'React SPA',
+  'proxy-service': 'Proxy Service',
 };
+
+async function scanRemotePorts(server: ServerConfig): Promise<number[]> {
+  const { host, user, sshKeyPath } = server;
+  const resolvedKeyPath = (sshKeyPath || '~/.ssh/id_rsa').replace(/^~/, os.homedir());
+  const keyArg = require('fs').existsSync(resolvedKeyPath) ? `-i "${resolvedKeyPath}"` : '';
+
+  try {
+    console.log(chalk.gray('  扫描服务器端口占用...'));
+    const result = execSync(
+      `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${keyArg} ${user}@${host} "ss -tlnp | awk '{print \\$4}' | grep -oP ':\\K[0-9]+$' | sort -un"`,
+      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    const ports = result.trim().split('\n').filter(Boolean).map(Number).filter(n => !isNaN(n));
+    console.log(chalk.green(`  ✔ 已扫描，${ports.length} 个端口被占用`));
+    return ports;
+  } catch (err: any) {
+    console.log(chalk.yellow(`  ⚠ 端口扫描失败 (${err.message?.slice(0, 50)}), 将跳过预检`));
+    return [];
+  }
+}
+
+function findAvailablePort(defaultPort: number, occupiedPorts: Set<number>): number {
+  let port = defaultPort;
+  while (occupiedPorts.has(port)) {
+    port++;
+  }
+  return port;
+}
 
 export async function collectConfig(detection: DetectionResult, projectName: string): Promise<CollectedConfig> {
   console.log(chalk.cyan('\n📋 开始收集部署配置...\n'));
 
-  const project = await collectProjectConfig(detection, projectName);
+  // 先收集服务器信息，以便扫描端口
   const server = await collectServerConfig();
+
+  // SSH 扫描服务器已占端口
+  const occupiedPorts = await scanRemotePorts(server);
+  const occupiedSet = new Set(occupiedPorts);
+
+  const project = await collectProjectConfig(detection, projectName, occupiedSet);
   const domain = await collectDomainConfig();
   const secrets = await collectSecrets(detection.envKeys);
   const branches = await collectBranchConfig();
 
+  const database = await collectDatabaseConfig(detection);
+
+  // Non-secret env vars get their values preserved for hardcoded .env generation
+  const secretSet = new Set(secrets);
+  const envVars: Record<string, string> = {};
+  for (const [key, value] of Object.entries(detection.envPairs)) {
+    if (!secretSet.has(key)) {
+      envVars[key] = value;
+    }
+  }
+
+  // Extract deploymentMode and proxyMode from project if present
+  const { deploymentMode, proxyMode, ...projectBase } = project as any;
+
   const config: CollectedConfig = {
-    project,
+    project: projectBase,
     server,
     domain,
     secrets,
+    envVars,
     branches,
-    registry: 'ghcr.io',
+    deploymentMode,
+    proxyMode,
+    database,
   };
 
   return await reviewLoop(config, detection);
 }
 
-async function collectProjectConfig(detection: DetectionResult, projectName: string) {
+async function collectProjectConfig(detection: DetectionResult, projectName: string, occupiedPorts: Set<number> = new Set()) {
   const typeChoices = Object.entries(PROJECT_TYPE_LABELS).map(([value, name]) => ({ name, value }));
 
-  const answers = await inquirer.prompt([
+  // 先问项目类型，以便确定默认端口
+  const typeAnswer = await inquirer.prompt([
     {
       type: 'input',
       name: 'name',
@@ -53,11 +108,37 @@ async function collectProjectConfig(detection: DetectionResult, projectName: str
       choices: typeChoices,
       default: detection.type,
     },
+  ]);
+
+  // 根据项目类型确定默认端口，并自动避开已占端口
+  const selectedType = typeAnswer.type as ProjectType;
+  const profile = FRAMEWORK_PROFILES[selectedType];
+  const rawDefault = detection.port || profile?.defaultPort || 3000;
+  const suggestedPort = findAvailablePort(rawDefault, occupiedPorts);
+
+  // 显示已占端口提示
+  if (occupiedPorts.size > 0) {
+    const appPorts = Array.from(occupiedPorts).filter(p => p >= 3000 && p <= 65535).sort((a, b) => a - b);
+    if (appPorts.length > 0) {
+      console.log(chalk.yellow(`  已占用的应用端口: ${appPorts.join(', ')}`));
+    }
+    if (suggestedPort !== rawDefault) {
+      console.log(chalk.yellow(`  默认端口 ${rawDefault} 已被占用，建议使用 ${suggestedPort}`));
+    }
+  }
+
+  const portAnswer = await inquirer.prompt([
     {
       type: 'number',
       name: 'port',
       message: '应用端口:',
-      default: detection.port,
+      default: suggestedPort,
+      validate: (v: number) => {
+        if (occupiedPorts.has(v)) {
+          return `端口 ${v} 已被服务器占用，请选择其他端口`;
+        }
+        return true;
+      },
     },
     {
       type: 'input',
@@ -73,10 +154,53 @@ async function collectProjectConfig(detection: DetectionResult, projectName: str
     },
   ]);
 
-  const type = answers.type as ProjectType;
+  const type = selectedType;
   const language: Language = ['flask', 'django', 'fastapi'].includes(type) ? 'python' : 'node';
 
-  return { ...answers, language };
+  // Proxy service specific options
+  let deploymentMode: 'generated' | 'existing-compose' = 'generated';
+  let proxyMode: 'host-nginx' | 'existing-caddy' | 'none' = 'host-nginx';
+
+  if (type === 'proxy-service') {
+    const deploymentAnswer = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'deploymentMode',
+        message: '部署模式:',
+        choices: [
+          { name: '生成 Docker Compose 配置', value: 'generated' },
+          { name: '使用现有 docker-compose.yml', value: 'existing-compose' },
+        ],
+        default: 'generated',
+      },
+    ]);
+    deploymentMode = deploymentAnswer.deploymentMode;
+
+    const proxyAnswer = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'proxyMode',
+        message: '反向代理模式:',
+        choices: [
+          { name: '宿主机 Nginx (自动配置)', value: 'host-nginx' },
+          { name: '现有 Caddy (跳过 Nginx 配置)', value: 'existing-caddy' },
+          { name: '无反向代理', value: 'none' },
+        ],
+        default: 'host-nginx',
+      },
+    ]);
+    proxyMode = proxyAnswer.proxyMode;
+  }
+
+  return {
+    ...typeAnswer,
+    ...portAnswer,
+    language,
+    projectStructure: detection.projectStructure || 'standard',
+    subDirs: detection.subDirs || {},
+    deploymentMode,
+    proxyMode,
+  };
 }
 
 async function collectServerConfig(): Promise<ServerConfig> {
@@ -205,6 +329,67 @@ async function collectSecrets(envKeys: string[]): Promise<string[]> {
   return secrets;
 }
 
+async function collectDatabaseConfig(detection: DetectionResult) {
+  const profile = detection.type ? FRAMEWORK_PROFILES[detection.type] : null;
+
+  let location: 'host' | 'container' | 'external' | 'none' = 'none';
+  if (detection.dbType !== 'none') {
+    const { dbLocation } = await inquirer.prompt([{
+      type: 'list',
+      name: 'dbLocation',
+      message: '数据库运行在哪里?',
+      choices: [
+        { name: '宿主机 (直接安装在服务器上)', value: 'host' },
+        { name: 'Docker 容器 (同一 compose 管理)', value: 'container' },
+        { name: '外部服务 (RDS/云数据库)', value: 'external' },
+      ],
+    }]);
+    location = dbLocation;
+  }
+
+  const { dataDir } = await inquirer.prompt([{
+    type: 'input',
+    name: 'dataDir',
+    message: '数据持久化目录 (留空则无):',
+    default: detection.dataDir || profile?.dataDir || '',
+  }]);
+
+  const { migrateCmd } = await inquirer.prompt([{
+    type: 'input',
+    name: 'migrateCmd',
+    message: '数据库迁移命令 (留空则无):',
+    default: profile?.dbMigrateCmd || '',
+  }]);
+
+  const { createAdmin } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'createAdmin',
+    message: '首次部署是否需要创建管理员账号?',
+    default: false,
+  }]);
+
+  let adminCmd = '';
+  if (createAdmin) {
+    const ans = await inquirer.prompt([{
+      type: 'input',
+      name: 'adminCmd',
+      message: '创建管理员命令:',
+      default: detection.type === 'django' ? 'python manage.py createsuperuser' : '',
+    }]);
+    adminCmd = ans.adminCmd;
+  }
+
+  return {
+    type: detection.dbType,
+    location,
+    dataDir,
+    initCmd: profile?.dbInitCmd || '',
+    migrateCmd,
+    createAdmin,
+    adminCmd,
+  };
+}
+
 async function collectBranchConfig() {
   const { production } = await inquirer.prompt([{
     type: 'input',
@@ -245,6 +430,12 @@ async function reviewLoop(config: CollectedConfig, detection: DetectionResult): 
       console.log(`  域名: ${config.domain.name} (HTTPS: ${config.domain.https ? '是' : '否'})`);
     }
     console.log(`  分支: ${config.branches.production}${config.branches.staging ? ` / ${config.branches.staging}` : ''}`);
+    if (config.database.dataDir) {
+      console.log(`  数据目录: ${config.database.dataDir}`);
+    }
+    if (config.database.migrateCmd) {
+      console.log(`  迁移命令: ${config.database.migrateCmd}`);
+    }
     if (config.secrets.length > 0) {
       console.log(`  Secrets: ${config.secrets.join(', ')}`);
     }
@@ -270,7 +461,7 @@ async function reviewLoop(config: CollectedConfig, detection: DetectionResult): 
     }
 
     if (action === 'project') {
-      const p = await collectProjectConfig(detection, config.project.name);
+      const p = await collectProjectConfig(detection, config.project.name, new Set());
       config.project = p;
     } else if (action === 'server') {
       config.server = await collectServerConfig();

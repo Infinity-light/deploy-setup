@@ -4,13 +4,15 @@ import ora from 'ora';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as dns from 'dns';
-import { Client } from 'ssh2';
 import { detectProject } from './core/detector';
 import { collectConfig } from './core/collector';
 import { generateFiles } from './core/generator';
+import { probeServer } from './core/prober';
+import { selectStrategy } from './core/strategy';
 import { saveProjectRecord } from './utils/config-store';
-import { saveCache, loadCache } from './utils/cache';
+import { saveCache, loadCache, saveDeployConfig } from './utils/cache';
 import { CollectedConfig } from './core/types';
+import { diffEnvKeys, patchDeployYml } from './core/env-sync';
 
 const program = new Command();
 
@@ -26,6 +28,7 @@ program
   .option('-d, --dir <dir>', '项目目录', process.cwd())
   .option('-c, --config <file>', '使用 JSON 配置文件（跳过交互）')
   .option('-k, --key <path>', 'SSH 私钥文件路径')
+  .option('-e, --env-file <path>', '从文件读取密钥值（跳过交互输入）')
   .action(async (options) => {
     const projectDir = path.resolve(options.dir);
 
@@ -41,7 +44,7 @@ program
     await runSetupServer(projectDir);
 
     // Step 4: setup-secrets
-    await runSetupSecrets(projectDir, options.key);
+    await runSetupSecrets(projectDir, options.key, options.envFile);
 
     // Step 5: git push
     await runPushAndVerify(projectDir, config.branches.production);
@@ -86,8 +89,87 @@ program
   .description('使用 gh CLI 配置 GitHub Secrets')
   .option('-d, --dir <dir>', '项目目录', process.cwd())
   .option('-k, --key <path>', 'SSH 私钥文件路径')
+  .option('-e, --env-file <path>', '从文件读取密钥值（跳过交互输入）')
   .action(async (options) => {
-    await runSetupSecrets(path.resolve(options.dir), options.key);
+    await runSetupSecrets(path.resolve(options.dir), options.key, options.envFile);
+  });
+
+// ─── detect ───
+program
+  .command('detect')
+  .description('自动检测项目信息')
+  .option('-d, --dir <dir>', '项目目录', process.cwd())
+  .option('--json', '输出 JSON 格式')
+  .action(async (options) => {
+    const projectDir = path.resolve(options.dir);
+    const detection = detectProject(projectDir);
+
+    if (options.json) {
+      console.log(JSON.stringify(detection, null, 2));
+    } else {
+      console.log(chalk.cyan.bold('\n📋 项目检测结果\n'));
+      console.log(chalk.gray('项目类型:'), detection.type || '未知');
+      console.log(chalk.gray('语言:'), detection.language || '未知');
+      console.log(chalk.gray('默认端口:'), detection.port);
+      console.log(chalk.gray('启动命令:'), detection.startCmd || '未设置');
+      if (detection.buildCmd) {
+        console.log(chalk.gray('构建命令:'), detection.buildCmd);
+      }
+      if (detection.envKeys.length > 0) {
+        console.log(chalk.gray('环境变量:'), detection.envKeys.join(', '));
+      }
+      if (detection.dbType !== 'none') {
+        console.log(chalk.gray('数据库:'), detection.dbType);
+        console.log(chalk.gray('ORM:'), detection.ormTool);
+      }
+      console.log('');
+    }
+  });
+
+// ─── probe ───
+program
+  .command('probe')
+  .description('探测服务器环境（内存、网络、Docker 等）')
+  .option('-d, --dir <dir>', '项目目录', process.cwd())
+  .option('--json', '输出 JSON 格式')
+  .action(async (options) => {
+    const projectDir = path.resolve(options.dir);
+    const config = loadCache(projectDir);
+
+    const spinner = ora('探测服务器环境...').start();
+    const probe = probeServer(config.server);
+    spinner.succeed('探测完成');
+
+    if (options.json) {
+      console.log(JSON.stringify(probe, null, 2));
+    } else {
+      console.log(chalk.cyan.bold('\n🔍 服务器探测结果\n'));
+      console.log(chalk.gray('内存:'), `${probe.memoryMB} MB`);
+      console.log(chalk.gray('CPU:'), `${probe.cpuCores} 核`);
+      console.log(chalk.gray('磁盘:'), `${probe.diskFreeGB} GB 可用`);
+      console.log(chalk.gray('Docker:'), probe.dockerInstalled ? '已安装' : '未安装');
+      console.log(chalk.gray('Docker Compose:'), probe.dockerComposeInstalled ? '已安装' : '未安装');
+      console.log(chalk.gray('Docker Hub:'), probe.dockerHubReachable ? '可达' : '不可达');
+      console.log(chalk.gray('npm:'), probe.npmReachable ? '可达' : '不可达');
+      console.log(chalk.gray('Alpine:'), probe.alpineReachable ? '可达' : '不可达');
+      console.log(chalk.gray('地区:'), probe.geoCountry);
+      console.log(chalk.gray('需要中国镜像:'), probe.needsChinaMirrors ? '是' : '否');
+      console.log('');
+    }
+  });
+
+// ─── sync-env ───
+program
+  .command('sync-env')
+  .description('同步 .env 变量到 GitHub Secrets 和 deploy.yml')
+  .option('-d, --dir <dir>', '项目目录', process.cwd())
+  .option('-e, --env-file <path>', '从文件读取密钥值')
+  .option('--dry-run', '仅显示差异，不修改', false)
+  .option('-y, --yes', '跳过交互，自动用正则分类 secret/hardcoded', false)
+  .option('--push-secrets', '自动推送新 secrets 到 GitHub', false)
+  .action(async (options) => {
+    const projectDir = path.resolve(options.dir);
+    await runSyncEnv(projectDir, options);
   });
 
 // ─── parse ───
@@ -115,6 +197,20 @@ async function runInit(projectDir: string, configFile?: string): Promise<Collect
     console.log(chalk.green(`  使用配置文件: ${path.resolve(configFile)}`));
   } else {
     config = await collectConfig(detection, projectName);
+  }
+
+  // Probe server and select strategy (if server config is available)
+  if (config.server?.host) {
+    const probeSpinner = ora('探测服务器环境...').start();
+    try {
+      const probe = probeServer(config.server);
+      probeSpinner.succeed('服务器探测完成');
+
+      const strategy = selectStrategy(probe, detection);
+      config.strategy = strategy;
+    } catch (err: any) {
+      probeSpinner.warn(`服务器探测失败: ${err.message}，使用默认策略（服务器构建）`);
+    }
   }
 
   console.log(chalk.cyan('\n📦 生成配置文件...\n'));
@@ -163,32 +259,32 @@ async function runSetupServer(projectDir: string): Promise<void> {
     throw new Error('server-init.sh 不存在，请先运行 deploy-setup init');
   }
 
-  const scriptContent = fs.readFileSync(scriptPath, 'utf-8');
   const { host, user, sshKeyPath } = config.server;
-
-  console.log(chalk.cyan(`\n🖥  连接服务器: ${user}@${host}\n`));
-
+  const { execSync } = require('child_process');
   const os = require('os');
   const resolvedKeyPath = (sshKeyPath || '~/.ssh/id_rsa').replace(/^~/, os.homedir());
 
-  if (fs.existsSync(resolvedKeyPath)) {
-    console.log(chalk.gray(`  使用密钥: ${resolvedKeyPath}`));
-    const privateKey = fs.readFileSync(resolvedKeyPath, 'utf-8');
-    await sshExec(host, user, { privateKey }, scriptContent);
-  } else {
-    console.log(chalk.gray('  未找到密钥，使用密码认证'));
-    const inquirer = require('inquirer');
-    const { password } = await inquirer.prompt([{
-      type: 'password',
-      name: 'password',
-      message: `${user}@${host} 密码:`,
-      mask: '*',
-    }]);
-    await sshExec(host, user, { password }, scriptContent);
+  console.log(chalk.cyan(`\n🖥  连接服务器: ${user}@${host}\n`));
+  console.log(chalk.gray(`  使用密钥: ${resolvedKeyPath}`));
+
+  const keyArg = fs.existsSync(resolvedKeyPath) ? `-i "${resolvedKeyPath}"` : '';
+  const sshCmd = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${keyArg} ${user}@${host} "bash -s" < "${scriptPath}"`;
+
+  // Convert CRLF to LF for Linux compatibility
+  const scriptContent = fs.readFileSync(scriptPath, 'utf-8').replace(/\r\n/g, '\n');
+  const lfScriptPath = scriptPath + '.lf';
+  fs.writeFileSync(lfScriptPath, scriptContent, 'utf-8');
+
+  try {
+    const lfSshCmd = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${keyArg} ${user}@${host} "bash -s" < "${lfScriptPath}"`;
+    execSync(lfSshCmd, { cwd: projectDir, stdio: 'inherit', timeout: 600000 });
+    console.log(chalk.green('  ✔ 服务器初始化完成'));
+  } finally {
+    if (fs.existsSync(lfScriptPath)) fs.unlinkSync(lfScriptPath);
   }
 }
 
-async function runSetupSecrets(projectDir: string, keyPath?: string): Promise<void> {
+async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath?: string): Promise<void> {
   const config = loadCache(projectDir);
   const { execSync } = require('child_process');
 
@@ -209,8 +305,27 @@ async function runSetupSecrets(projectDir: string, keyPath?: string): Promise<vo
   try {
     execSync('gh auth status', { stdio: 'ignore', cwd: projectDir });
   } catch {
-    console.log(chalk.yellow('gh 未登录，正在启动登录流程...'));
-    execSync('gh auth login', { stdio: 'inherit', cwd: projectDir });
+    console.log(chalk.yellow('gh 未登录，正在启动登录流程 (SSH 协议)...'));
+    execSync('gh auth login --git-protocol ssh', { stdio: 'inherit', cwd: projectDir });
+  }
+
+  // Parse env-file if provided
+  let envFileMap: Record<string, string> = {};
+  if (envFilePath) {
+    const resolvedEnvFile = envFilePath.replace(/^~/, require('os').homedir());
+    if (fs.existsSync(resolvedEnvFile)) {
+      const content = fs.readFileSync(resolvedEnvFile, 'utf-8');
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx === -1) continue;
+        envFileMap[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+      }
+      console.log(chalk.green(`  已加载 env-file: ${resolvedEnvFile} (${Object.keys(envFileMap).length} 个变量)`));
+    } else {
+      console.log(chalk.yellow(`  ⚠ env-file 不存在: ${resolvedEnvFile}，将回退到交互输入`));
+    }
   }
 
   console.log(chalk.cyan('\n🔑 配置 GitHub Secrets\n'));
@@ -247,6 +362,61 @@ async function runSetupSecrets(projectDir: string, keyPath?: string): Promise<vo
       console.log(chalk.green(`  ✔ ${name}`));
     } catch (err: any) {
       console.log(chalk.red(`  ✗ ${name}: ${err.message}`));
+    }
+  }
+
+  // Business secrets from .env (config.secrets)
+  const infraKeys = new Set(['SERVER_HOST', 'SERVER_USER', 'SSH_PRIVATE_KEY']);
+  const businessKeys = (config.secrets || []).filter((k: string) => !infraKeys.has(k));
+
+  if (businessKeys.length > 0) {
+    console.log(chalk.cyan('\n🔐 配置业务密钥\n'));
+
+    if (Object.keys(envFileMap).length > 0) {
+      // Auto-inject from env-file
+      for (const key of businessKeys) {
+        const value = envFileMap[key];
+        if (value) {
+          try {
+            execSync(`gh secret set ${key}`, {
+              input: value, cwd: projectDir,
+              stdio: ['pipe', 'ignore', 'pipe'],
+            });
+            console.log(chalk.green(`  ✔ ${key} (from env-file)`));
+          } catch (err: any) {
+            console.log(chalk.red(`  ✗ ${key}: ${err.message}`));
+          }
+        } else {
+          console.log(chalk.yellow(`  ⏭ ${key}: 未在 env-file 中找到，跳过`));
+        }
+      }
+    } else {
+      // Interactive input
+      const inquirer = require('inquirer');
+
+      for (const key of businessKeys) {
+        const { value } = await inquirer.prompt([{
+          type: 'password',
+          name: 'value',
+          message: `${key}:`,
+          mask: '*',
+        }]);
+
+        if (!value) {
+          console.log(chalk.yellow(`  ⏭ ${key}: 值为空，已跳过`));
+          continue;
+        }
+
+        try {
+          execSync(`gh secret set ${key}`, {
+            input: value, cwd: projectDir,
+            stdio: ['pipe', 'ignore', 'pipe'],
+          });
+          console.log(chalk.green(`  ✔ ${key}`));
+        } catch (err: any) {
+          console.log(chalk.red(`  ✗ ${key}: ${err.message}`));
+        }
+      }
     }
   }
 
@@ -303,27 +473,6 @@ async function runPushAndVerify(projectDir: string, branch: string): Promise<voi
   console.log(chalk.yellow('  等待超时，请手动检查 Actions 状态'));
 }
 
-function sshExec(host: string, user: string, auth: { privateKey?: string; password?: string }, script: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const conn = new Client();
-    conn.on('ready', () => {
-      console.log(chalk.green('  ✔ SSH 连接成功'));
-      conn.exec(script, (err, stream) => {
-        if (err) { conn.end(); return reject(err); }
-        stream.on('data', (data: Buffer) => process.stdout.write(data));
-        stream.stderr.on('data', (data: Buffer) => process.stderr.write(data));
-        stream.on('close', (code: number) => {
-          conn.end();
-          if (code === 0) resolve();
-          else reject(new Error(`脚本退出码: ${code}`));
-        });
-      });
-    });
-    conn.on('error', reject);
-    conn.connect({ host, port: 22, username: user, ...auth });
-  });
-}
-
 async function installGhCli(): Promise<void> {
   const { execSync } = require('child_process');
   const platform = process.platform;
@@ -343,6 +492,198 @@ async function installGhCli(): Promise<void> {
       { stdio: 'inherit' }
     );
   }
+}
+
+async function runSyncEnv(projectDir: string, options: { dryRun?: boolean; yes?: boolean; pushSecrets?: boolean; envFile?: string }): Promise<void> {
+  console.log(chalk.cyan.bold('\n🔄 deploy-setup sync-env - 环境变量同步\n'));
+
+  // 1. Load cached config
+  let config: CollectedConfig;
+  try {
+    config = loadCache(projectDir);
+  } catch {
+    console.log(chalk.red('未找到配置缓存，请先运行 deploy-setup init'));
+    process.exit(1);
+  }
+
+  // 2. Re-detect .env
+  const spinner = ora('扫描 .env 文件...').start();
+  const detection = detectProject(projectDir);
+  spinner.succeed(
+    detection.envFile
+      ? `找到: ${detection.envFile} (${detection.envKeys.length} 个变量)`
+      : '未找到 .env 文件'
+  );
+
+  if (!detection.envFile || detection.envKeys.length === 0) {
+    console.log(chalk.yellow('没有环境变量可同步'));
+    return;
+  }
+
+  // 3. Diff
+  const diff = diffEnvKeys(detection.envKeys, config);
+
+  console.log(chalk.cyan('\n━━━ 变量差异 ━━━'));
+  if (diff.added.length > 0) {
+    console.log(chalk.green(`  新增 (${diff.added.length}):`));
+    diff.added.forEach(k => console.log(chalk.green(`    + ${k}`)));
+  }
+  if (diff.removed.length > 0) {
+    console.log(chalk.red(`  移除 (${diff.removed.length}):`));
+    diff.removed.forEach(k => console.log(chalk.red(`    - ${k}`)));
+  }
+  if (diff.unchanged.length > 0) {
+    console.log(chalk.gray(`  不变 (${diff.unchanged.length}):`));
+    diff.unchanged.forEach(k => console.log(chalk.gray(`    = ${k}`)));
+  }
+  console.log(chalk.cyan('━━━━━━━━━━━━━━━━\n'));
+
+  if (diff.added.length === 0 && diff.removed.length === 0) {
+    console.log(chalk.green('环境变量无变化，无需同步'));
+    return;
+  }
+
+  if (options.dryRun) {
+    console.log(chalk.yellow('--dry-run 模式，不执行任何修改'));
+    return;
+  }
+
+  // 4. Classify new keys as secret or hardcoded
+  if (diff.added.length > 0) {
+    let newSecretSet: Set<string>;
+
+    if (options.yes) {
+      // Auto-classify using regex heuristic
+      newSecretSet = new Set(diff.added.filter((k: string) => /secret|password|key|token|api/i.test(k)));
+      console.log(chalk.gray('  --yes 模式，自动分类:'));
+      for (const key of diff.added) {
+        const label = newSecretSet.has(key) ? 'SECRET' : 'HARDCODED';
+        console.log(chalk.gray(`    ${key} => ${label}`));
+      }
+    } else {
+      const inquirer = require('inquirer');
+      const { newSecrets } = await inquirer.prompt([{
+        type: 'checkbox',
+        name: 'newSecrets',
+        message: '选择新增变量中需要作为 GitHub Secrets 的敏感变量:',
+        choices: diff.added.map((k: string) => ({
+          name: k,
+          value: k,
+          checked: /secret|password|key|token|api/i.test(k),
+        })),
+      }]);
+      newSecretSet = new Set(newSecrets as string[]);
+    }
+
+    if (!config.envVars) config.envVars = {};
+    for (const key of diff.added) {
+      if (newSecretSet.has(key)) {
+        config.secrets.push(key);
+      } else {
+        config.envVars[key] = detection.envPairs[key] || '';
+      }
+    }
+  }
+
+  // 5. Handle removed keys
+  if (diff.removed.length > 0) {
+    let confirmRemove = true;
+
+    if (!options.yes) {
+      const inquirer = require('inquirer');
+      const answer = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirmRemove',
+        message: `确认移除 ${diff.removed.length} 个不再使用的变量?`,
+        default: true,
+      }]);
+      confirmRemove = answer.confirmRemove;
+    } else {
+      console.log(chalk.gray(`  --yes 模式，自动移除 ${diff.removed.length} 个变量`));
+    }
+
+    if (confirmRemove) {
+      const removedSet = new Set(diff.removed);
+      config.secrets = config.secrets.filter((k: string) => !removedSet.has(k));
+      for (const key of diff.removed) {
+        delete config.envVars[key];
+      }
+    }
+  }
+
+  // 6. Patch deploy.yml
+  const deployYmlPath = path.join(projectDir, '.github', 'workflows', 'deploy.yml');
+  if (fs.existsSync(deployYmlPath)) {
+    const patchSpinner = ora('更新 deploy.yml...').start();
+    try {
+      const content = fs.readFileSync(deployYmlPath, 'utf-8');
+      const patched = patchDeployYml(content, config.envVars, config.secrets);
+      fs.writeFileSync(deployYmlPath, patched, 'utf-8');
+      patchSpinner.succeed('deploy.yml 已更新');
+    } catch (err: any) {
+      patchSpinner.fail(`deploy.yml 更新失败: ${err.message}`);
+    }
+  } else {
+    console.log(chalk.yellow('  未找到 deploy.yml，跳过 workflow 更新'));
+  }
+
+  // 7. Save cache + deploy-config.json
+  saveCache(projectDir, config);
+  saveDeployConfig(projectDir, config);
+  console.log(chalk.green('  配置已保存'));
+
+  // 8. Push secrets
+  if (options.pushSecrets && diff.added.length > 0) {
+    const { execSync } = require('child_process');
+    const newSecretKeys = diff.added.filter((k: string) => config.secrets.includes(k));
+
+    if (newSecretKeys.length > 0) {
+      // Parse env-file if provided
+      let envFileMap: Record<string, string> = {};
+      if (options.envFile) {
+        const resolvedEnvFile = options.envFile.replace(/^~/, require('os').homedir());
+        if (fs.existsSync(resolvedEnvFile)) {
+          const efContent = fs.readFileSync(resolvedEnvFile, 'utf-8');
+          for (const line of efContent.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eqIdx = trimmed.indexOf('=');
+            if (eqIdx === -1) continue;
+            envFileMap[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          }
+        }
+      }
+
+      // Also read from detected .env as fallback
+      const detectedEnvMap = detection.envPairs;
+
+      console.log(chalk.cyan('\n🔑 推送新 Secrets 到 GitHub\n'));
+      for (const key of newSecretKeys) {
+        const value = envFileMap[key] || detectedEnvMap[key] || '';
+        if (!value) {
+          console.log(chalk.yellow(`  ⏭ ${key}: 值为空，跳过`));
+          continue;
+        }
+        try {
+          execSync(`gh secret set ${key}`, {
+            input: value, cwd: projectDir,
+            stdio: ['pipe', 'ignore', 'pipe'],
+          });
+          console.log(chalk.green(`  ✔ ${key}`));
+        } catch (err: any) {
+          console.log(chalk.red(`  ✗ ${key}: ${err.message}`));
+        }
+      }
+    }
+  } else if (diff.added.some((k: string) => config.secrets.includes(k))) {
+    const newSecretKeys = diff.added.filter((k: string) => config.secrets.includes(k));
+    console.log(chalk.yellow('\n📌 以下新 Secrets 需要手动推送到 GitHub:'));
+    for (const key of newSecretKeys) {
+      console.log(chalk.yellow(`  gh secret set ${key}`));
+    }
+  }
+
+  console.log(chalk.green.bold('\n✅ 环境变量同步完成\n'));
 }
 
 function printNextSteps(config: CollectedConfig): void {

@@ -8,6 +8,9 @@
   },
   "scripts": {
     "build": "tsc",
+    "postbuild": "node -e \"const fs=require('fs');const p=require('path');function c(s,d){fs.mkdirSync(d,{recursive:true});for(const f of fs.readdirSync(s)){const sp=p.join(s,f),dp=p.join(d,f);fs.statSync(sp).isDirectory()?c(sp,dp):fs.copyFileSync(sp,dp)}}c('src/templates','dist/templates')\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "dev": "tsc --watch",
     "start": "node dist/cli.js"
   },
@@ -23,13 +26,12 @@
     "chalk": "^4.1.2",
     "commander": "^11.1.0",
     "inquirer": "^8.2.6",
-    "ora": "^5.4.1",
-    "ssh2": "^1.17.0"
+    "ora": "^5.4.1"
   },
   "devDependencies": {
     "@types/inquirer": "^8.2.10",
     "@types/node": "^20.11.0",
-    "@types/ssh2": "^1.15.5",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^4.0.18"
   }
 }

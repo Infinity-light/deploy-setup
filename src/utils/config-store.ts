@@ -3,26 +3,33 @@ import * as path from 'path';
 import * as os from 'os';
 import { GlobalConfig, ServerConfig } from '../core/types';
 
-const CONFIG_DIR = path.join(os.homedir(), '.deploy-setup');
-const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+function getConfigDir(): string {
+  return process.env.DEPLOY_SETUP_CONFIG_DIR || path.join(os.homedir(), '.deploy-setup');
+}
+
+function getConfigFile(): string {
+  return path.join(getConfigDir(), 'config.json');
+}
 
 function ensureDir(): void {
-  if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const dir = getConfigDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
 
 export function loadGlobalConfig(): GlobalConfig {
   ensureDir();
-  if (!fs.existsSync(CONFIG_FILE)) {
+  const configFile = getConfigFile();
+  if (!fs.existsSync(configFile)) {
     return { servers: {}, projects: {} };
   }
-  return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+  return JSON.parse(fs.readFileSync(configFile, "utf-8"));
 }
 
 export function saveGlobalConfig(config: GlobalConfig): void {
   ensureDir();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  fs.writeFileSync(getConfigFile(), JSON.stringify(config, null, 2), "utf-8");
 }
 
 export function getSavedServers(): Record<string, ServerConfig> {

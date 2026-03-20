@@ -1,0 +1,129 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - {{BRANCH_PRODUCTION}}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t {{APP_NAME}}:${{ github.sha }} .
+          echo "Image built successfully"
+          docker images {{APP_NAME}}:${{ github.sha }}
+
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke-test -p {{APP_PORT}}:{{APP_PORT}} {{APP_NAME}}:${{ github.sha }}
+          echo "Waiting for container to start..."
+          sleep 8
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{APP_PORT}}/ || true)
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
+              echo "Smoke test passed (HTTP $STATUS)"
+              docker stop smoke-test && docker rm smoke-test
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS, retrying in 3s..."
+            sleep 3
+          done
+          echo "Smoke test failed"
+          docker logs smoke-test
+          docker stop smoke-test && docker rm smoke-test
+          exit 1
+
+      - name: Package image
+        run: |
+          docker save {{APP_NAME}}:${{ github.sha }} | gzip > /tmp/image.tar.gz
+          ls -lh /tmp/image.tar.gz
+
+      - name: Transfer image to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "/tmp/image.tar.gz"
+          target: "/tmp"
+          strip_components: 2
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          script: |
+            set -e
+            cd {{DEPLOY_DIR}}/{{APP_NAME}}
+
+            # Load the pre-built image
+            echo "Loading Docker image..."
+            docker load < /tmp/image.tar.gz
+            rm -f /tmp/image.tar.gz
+
+            # Tag for compose
+            IMAGE_ID=$(docker images --format '{{.ID}}' --filter "reference={{APP_NAME}}" | head -1)
+            docker tag $IMAGE_ID {{APP_NAME}}:latest
+
+            # Generate .env
+            cat > .env << 'ENVEOF'
+{{ENV_HARDCODED_LINES}}
+            ENVEOF
+            sed -i 's/^ *//' .env
+{{ENV_SECRET_LINES}}
+
+            # Deploy
+            docker compose up -d --no-build
+{{#IF DB_MIGRATE_CMD}}
+            echo "Running database migration..."
+            docker compose exec -T {{APP_NAME}} {{DB_MIGRATE_CMD}}
+{{/IF}}
+
+            # Cleanup
+            docker image prune -f
+            echo "Deployment complete"
+
+      - name: Health check
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Waiting for container to start..."
+            sleep 10
+            for i in 1 2 3 4 5; do
+              STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{APP_PORT}}/ || true)
+              if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
+                echo "Health check passed (HTTP $STATUS)"
+                exit 0
+              fi
+              echo "Attempt $i: HTTP $STATUS, retrying in 5s..."
+              sleep 5
+            done
+            echo "Health check failed after 5 attempts"
+            docker logs {{APP_NAME}} --tail 30
+
+            # Auto-cleanup on failure
+            echo "Cleaning up failed deployment..."
+            docker compose -f {{DEPLOY_DIR}}/{{APP_NAME}}/docker-compose.yml down 2>/dev/null || true
+            docker image prune -f
+            exit 1

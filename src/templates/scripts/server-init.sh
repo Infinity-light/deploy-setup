@@ -50,6 +50,20 @@ else
     ok "Docker 安装完成: $(docker --version)"
 fi
 
+# ─── Step 1.5: Docker 镜像源 ───
+MIRROR_DOCKER="{{MIRROR_DOCKER}}"
+if [ -n "${MIRROR_DOCKER}" ]; then
+    step "1.5/7 配置 Docker 镜像源"
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << DAEMON_EOF
+{
+  "registry-mirrors": [${MIRROR_DOCKER}]
+}
+DAEMON_EOF
+    systemctl restart docker
+    ok "Docker 镜像源已配置"
+fi
+
 # ─── Step 2: Docker Compose ───
 step "2/7 检查 Docker Compose"
 if docker compose version &> /dev/null; then
@@ -65,11 +79,30 @@ mkdir -p "${APP_DIR}"
 ok "目录就绪: ${APP_DIR}"
 ls -la "${APP_DIR}"
 
-# ─── Step 4: 确保 .env 存在 ───
+# ─── Step 3.5: 端口冲突检测 ───
+step "3.5/7 检查端口 ${APP_PORT}"
+CONFLICT_PID=$(ss -tlnp | grep ":${APP_PORT} " | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+if [ -n "$CONFLICT_PID" ]; then
+    CONFLICT_CMD=$(ps -p "$CONFLICT_PID" -o comm= 2>/dev/null || echo "unknown")
+    echo -e "${RED}  ⚠ 端口 ${APP_PORT} 已被占用: PID=$CONFLICT_PID ($CONFLICT_CMD)${NC}"
+    echo "  请手动处理后重新运行:"
+    echo "    kill $CONFLICT_PID  # 或 pm2 delete <name>"
+    exit 1
+else
+    ok "端口 ${APP_PORT} 可用"
+fi
+
+# ─── Step 4: 初始化 .env ───
 step "4/7 初始化 .env"
 if [ ! -f "${APP_DIR}/.env" ]; then
-    touch "${APP_DIR}/.env"
-    ok "已创建空 .env (请按需填入环境变量)"
+    cat > "${APP_DIR}/.env" << 'ENVFILE'
+{{ENV_HARDCODED_LINES}}
+{{ENV_SECRET_PLACEHOLDER_LINES}}
+ENVFILE
+    sed -i 's/^ *//' "${APP_DIR}/.env"
+    ok "已生成 .env（非敏感值已填入，敏感值由 CI/CD 注入）"
+    echo "  ${APP_DIR}/.env"
+    cat "${APP_DIR}/.env"
 else
     ok ".env 已存在，跳过"
 fi
@@ -83,8 +116,9 @@ else
     echo "  当前目录无 docker-compose.yml，跳过（后续由 CI/CD 部署）"
 fi
 
-# ─── Step 5: Nginx 反向代理 ───
-if [ "${DOMAIN_ENABLED}" = "true" ]; then
+# ─── Step 6: Nginx 反向代理 ───
+PROXY_MODE="{{PROXY_MODE}}"
+if [ "${DOMAIN_ENABLED}" = "true" ] && [ "${PROXY_MODE}" != "existing-caddy" ] && [ "${PROXY_MODE}" != "none" ]; then
     step "6/7 配置 Nginx 反向代理"
 
     if ! command -v nginx &> /dev/null; then
@@ -117,6 +151,12 @@ NGINX
     systemctl reload nginx
     ok "反向代理已生效: ${DOMAIN_NAME} → 127.0.0.1:${APP_PORT}"
     echo "  验证: curl -H 'Host: ${DOMAIN_NAME}' http://127.0.0.1"
+elif [ "${DOMAIN_ENABLED}" = "true" ] && [ "${PROXY_MODE}" = "existing-caddy" ]; then
+    step "6/7 Nginx"
+    echo "  使用现有 Caddy，跳过 Nginx 配置"
+elif [ "${DOMAIN_ENABLED}" = "true" ] && [ "${PROXY_MODE}" = "none" ]; then
+    step "6/7 Nginx"
+    echo "  无反向代理，跳过"
 else
     step "6/7 Nginx"
     echo "  未配置域名，跳过"
@@ -138,6 +178,11 @@ else
     step "7/7 HTTPS"
     echo "  未启用，跳过"
 fi
+
+# ─── Pre-deploy cleanup ───
+step "清理旧资源"
+docker image prune -f 2>/dev/null || true
+ok "清理完成"
 
 # ─── 完成 ───
 echo ""

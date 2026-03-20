@@ -6,9 +6,24 @@ export type ProjectType =
   | 'nextjs'
   | 'nuxtjs'
   | 'vue-spa'
-  | 'react-spa';
+  | 'react-spa'
+  | 'proxy-service';
 
 export type Language = 'python' | 'node';
+
+export type DbType = 'sqlite' | 'postgres' | 'mysql' | 'none';
+export type OrmTool = 'alembic' | 'django-migrations' | 'prisma' | 'typeorm' | 'none';
+
+export interface FrameworkProfile {
+  dataDir: string;
+  dbInitCmd: string;
+  dbMigrateCmd: string;
+  ormTool: OrmTool;
+  defaultPort: number;
+  startCmd: string;
+  buildCmd: string;
+  entryFile: string;
+}
 
 export interface DetectionResult {
   type: ProjectType | null;
@@ -20,8 +35,15 @@ export interface DetectionResult {
   entryFile: string;
   envFile: string | null;
   envKeys: string[];
+  envPairs: Record<string, string>;
   hasDocker: boolean;
   hasCI: boolean;
+  dataDir: string;
+  dbType: DbType;
+  ormTool: OrmTool;
+  projectStructure: 'standard' | 'multi-dir';
+  subDirs: { server?: string; client?: string };
+  nativeModules: string[];
 }
 
 export interface ServerConfig {
@@ -50,12 +72,53 @@ export interface CollectedConfig {
     port: number;
     buildCmd: string;
     startCmd: string;
+    projectStructure: 'standard' | 'multi-dir';
+    subDirs: { server?: string; client?: string };
   };
   server: ServerConfig;
   domain: DomainConfig;
   secrets: string[];
+  envVars: Record<string, string>;
   branches: BranchConfig;
-  registry: string;
+  deploymentMode?: 'generated' | 'existing-compose';
+  proxyMode?: 'host-nginx' | 'existing-caddy' | 'none';
+
+  strategy?: DeployStrategy;
+
+  database: {
+    type: DbType;
+    location: 'host' | 'container' | 'external' | 'none';
+    dataDir: string;
+    initCmd: string;
+    migrateCmd: string;
+    createAdmin: boolean;
+    adminCmd: string;
+  };
+}
+
+export interface ProbeResult {
+  memoryMB: number;
+  cpuCores: number;
+  diskFreeGB: number;
+  dockerInstalled: boolean;
+  dockerComposeInstalled: boolean;
+  dockerHubReachable: boolean;
+  npmReachable: boolean;
+  alpineReachable: boolean;
+  geoCountry: string;
+  needsChinaMirrors: boolean;
+}
+
+export interface DeployStrategy {
+  buildLocation: 'ci' | 'server';
+  transferMethod: 'scp' | 'registry' | 'none';
+  mirrors: {
+    alpine?: string;
+    npm?: string;
+    pip?: string;
+    docker?: string[];
+  };
+  needsBuildTools: boolean;
 }
 
 export interface GlobalConfig {
@@ -63,18 +126,105 @@ export interface GlobalConfig {
   projects: Record<string, { type: ProjectType; lastDeploy?: string }>;
 }
 
-export const PROJECT_DEFAULTS: Record<ProjectType, {
-  port: number;
-  buildCmd: string;
-  startCmd: string;
-  entryFile: string;
-}> = {
-  flask: { port: 5000, buildCmd: '', startCmd: 'gunicorn -w 4 -b 0.0.0.0:5000 app:app', entryFile: 'app.py' },
-  django: { port: 8000, buildCmd: 'python manage.py collectstatic --noinput', startCmd: 'gunicorn -w 4 -b 0.0.0.0:8000 config.wsgi:application', entryFile: 'manage.py' },
-  fastapi: { port: 8000, buildCmd: '', startCmd: 'uvicorn main:app --host 0.0.0.0 --port 8000', entryFile: 'main.py' },
-  nestjs: { port: 3000, buildCmd: 'npm run build', startCmd: 'node dist/main', entryFile: 'src/main.ts' },
-  nextjs: { port: 3000, buildCmd: 'npm run build', startCmd: 'npm start', entryFile: 'pages/index.tsx' },
-  nuxtjs: { port: 3000, buildCmd: 'npm run build', startCmd: 'node .output/server/index.mjs', entryFile: 'nuxt.config.ts' },
-  'vue-spa': { port: 80, buildCmd: 'npm run build', startCmd: '', entryFile: 'src/main.ts' },
-  'react-spa': { port: 80, buildCmd: 'npm run build', startCmd: '', entryFile: 'src/index.tsx' },
+export const FRAMEWORK_PROFILES: Record<ProjectType, FrameworkProfile> = {
+  flask: {
+    dataDir: 'instance',
+    dbInitCmd: 'flask db upgrade',
+    dbMigrateCmd: 'flask db upgrade',
+    ormTool: 'alembic',
+    defaultPort: 5000,
+    startCmd: 'gunicorn -w 4 -b 0.0.0.0:5000 app:app',
+    buildCmd: '',
+    entryFile: 'app.py',
+  },
+  django: {
+    dataDir: 'media',
+    dbInitCmd: 'python manage.py migrate',
+    dbMigrateCmd: 'python manage.py migrate',
+    ormTool: 'django-migrations',
+    defaultPort: 8000,
+    startCmd: 'gunicorn -w 4 -b 0.0.0.0:8000 config.wsgi:application',
+    buildCmd: 'python manage.py collectstatic --noinput',
+    entryFile: 'manage.py',
+  },
+  fastapi: {
+    dataDir: 'data',
+    dbInitCmd: 'alembic upgrade head',
+    dbMigrateCmd: 'alembic upgrade head',
+    ormTool: 'alembic',
+    defaultPort: 8000,
+    startCmd: 'uvicorn main:app --host 0.0.0.0 --port 8000',
+    buildCmd: '',
+    entryFile: 'main.py',
+  },
+  nestjs: {
+    dataDir: 'uploads',
+    dbInitCmd: 'npx prisma migrate deploy',
+    dbMigrateCmd: 'npx prisma migrate deploy',
+    ormTool: 'prisma',
+    defaultPort: 3000,
+    startCmd: 'node dist/main',
+    buildCmd: 'npm run build',
+    entryFile: 'src/main.ts',
+  },
+  nextjs: {
+    dataDir: '.next',
+    dbInitCmd: 'npx prisma migrate deploy',
+    dbMigrateCmd: 'npx prisma migrate deploy',
+    ormTool: 'prisma',
+    defaultPort: 3000,
+    startCmd: 'npm start',
+    buildCmd: 'npm run build',
+    entryFile: 'pages/index.tsx',
+  },
+  nuxtjs: {
+    dataDir: '.output',
+    dbInitCmd: 'npx prisma migrate deploy',
+    dbMigrateCmd: 'npx prisma migrate deploy',
+    ormTool: 'prisma',
+    defaultPort: 3000,
+    startCmd: 'node .output/server/index.mjs',
+    buildCmd: 'npm run build',
+    entryFile: 'nuxt.config.ts',
+  },
+  'vue-spa': {
+    dataDir: '',
+    dbInitCmd: '',
+    dbMigrateCmd: '',
+    ormTool: 'none',
+    defaultPort: 80,
+    startCmd: '',
+    buildCmd: 'npm run build',
+    entryFile: 'src/main.ts',
+  },
+  'react-spa': {
+    dataDir: '',
+    dbInitCmd: '',
+    dbMigrateCmd: '',
+    ormTool: 'none',
+    defaultPort: 80,
+    startCmd: '',
+    buildCmd: 'npm run build',
+    entryFile: 'src/index.tsx',
+  },
+  'proxy-service': {
+    dataDir: '',
+    dbInitCmd: '',
+    dbMigrateCmd: '',
+    ormTool: 'none',
+    defaultPort: 8080,
+    startCmd: '',
+    buildCmd: '',
+    entryFile: '',
+  },
 };
+
+// Backward compatibility alias
+export const PROJECT_DEFAULTS = Object.fromEntries(
+  Object.entries(FRAMEWORK_PROFILES).map(([k, v]) => [k, {
+    port: v.defaultPort,
+    buildCmd: v.buildCmd,
+    startCmd: v.startCmd,
+    entryFile: v.entryFile,
+  }])
+) as Record<ProjectType, { port: number; buildCmd: string; startCmd: string; entryFile: string }>;

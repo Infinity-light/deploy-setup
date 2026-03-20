@@ -15,3 +15,7 @@ export function loadCache(dir: string): CollectedConfig {
   }
   return JSON.parse(fs.readFileSync(file, 'utf-8'));
 }
+
+export function saveDeployConfig(dir: string, config: CollectedConfig): void {
+  fs.writeFileSync(path.join(dir, 'deploy-config.json'), JSON.stringify(config, null, 2), 'utf-8');
+}

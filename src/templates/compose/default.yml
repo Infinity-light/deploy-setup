@@ -1,21 +1,32 @@
 services:
   {{APP_NAME}}:
-    image: {{REGISTRY}}/{{GITHUB_USER}}/{{APP_NAME}}:latest
+    build: .
     container_name: {{APP_NAME}}
     restart: unless-stopped
+{{#IF DB_ON_HOST}}
+    network_mode: host
+{{/IF}}
+{{#IF NOT_DB_ON_HOST}}
     ports:
       - "{{APP_PORT}}:{{APP_PORT}}"
+{{/IF}}
     env_file:
       - path: .env
         required: false
+{{#IF DATA_DIR}}
     volumes:
-      - {{APP_NAME}}-data:/app/data
+      - {{APP_NAME}}-data:/app/{{DATA_DIR}}
+{{/IF}}
+{{#IF NOT_DB_ON_HOST}}
     networks:
       - app-network
 
 networks:
   app-network:
     driver: bridge
+{{/IF}}
+{{#IF DATA_DIR}}
 
 volumes:
   {{APP_NAME}}-data:
+{{/IF}}
