@@ -34,12 +34,16 @@ export function probeServer(server: ServerConfig): ProbeResult {
   `.trim();
 
   let output: string;
+  const tmpScript = require('path').join(os.tmpdir(), `deploy_probe_${Date.now()}.sh`);
   try {
-    output = execSync(`${sshBase} "bash -s" << 'PROBE_EOF'\n${script}\nPROBE_EOF`, {
+    fs.writeFileSync(tmpScript, script, 'utf-8');
+    output = execSync(`${sshBase} "bash -s" < "${tmpScript}"`, {
       encoding: 'utf-8',
       timeout: 60000,
     });
+    if (fs.existsSync(tmpScript)) fs.unlinkSync(tmpScript);
   } catch (err: any) {
+    if (fs.existsSync(tmpScript)) fs.unlinkSync(tmpScript);
     // If SSH fails, return conservative defaults
     console.warn(`Server probe failed: ${err.message}. Using conservative defaults.`);
     return {

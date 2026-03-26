@@ -268,11 +268,9 @@ async function runSetupServer(projectDir: string): Promise<void> {
   console.log(chalk.gray(`  使用密钥: ${resolvedKeyPath}`));
 
   const keyArg = fs.existsSync(resolvedKeyPath) ? `-i "${resolvedKeyPath}"` : '';
-  const sshCmd = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${keyArg} ${user}@${host} "bash -s" < "${scriptPath}"`;
-
-  // Convert CRLF to LF for Linux compatibility
+  // Convert CRLF to LF for Linux compatibility and write to ASCII temp path to avoid cmd.exe issues with non-ASCII paths
   const scriptContent = fs.readFileSync(scriptPath, 'utf-8').replace(/\r\n/g, '\n');
-  const lfScriptPath = scriptPath + '.lf';
+  const lfScriptPath = path.join(os.tmpdir(), `server-init-${Date.now()}.sh`);
   fs.writeFileSync(lfScriptPath, scriptContent, 'utf-8');
 
   try {
