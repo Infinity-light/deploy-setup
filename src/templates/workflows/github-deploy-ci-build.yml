@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - {{BRANCH_PRODUCTION}}
+  workflow_dispatch:
 
 # Serialize deployments targeting the same server — prevents two
 # concurrent runs from racing on the remote machine when multiple
