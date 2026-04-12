@@ -1,6 +1,6 @@
 {
   "name": "deploy-setup",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "通用 CI/CD 配置生成工具 - git push 即部署到 Linux VPS",
   "main": "dist/cli.js",
   "bin": {

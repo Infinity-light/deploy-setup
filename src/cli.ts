@@ -14,6 +14,7 @@ import { saveCache, loadCache, saveDeployConfig } from './utils/cache';
 import { CollectedConfig } from './core/types';
 import { diffEnvKeys, patchDeployYml } from './core/env-sync';
 import { acquireServerLock } from './utils/deploy-lock';
+import { redeployProject } from './core/redeployer';
 
 const program = new Command();
 
@@ -171,6 +172,19 @@ program
   .action(async (options) => {
     const projectDir = path.resolve(options.dir);
     await runSyncEnv(projectDir, options);
+  });
+
+// ─── redeploy ───
+program
+  .command('redeploy')
+  .description('触发 CI workflow_dispatch 重新部署（代码不变）')
+  .option('-c, --config <path>', 'deploy config 路径', '.deploy/config.json')
+  .option('-w, --workflow <name>', '指定 workflow 文件名', '')
+  .action(async (opts) => {
+    await redeployProject({
+      configPath: opts.config,
+      workflow: opts.workflow || undefined,
+    });
   });
 
 // ─── parse ───
