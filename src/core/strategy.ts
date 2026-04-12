@@ -29,6 +29,7 @@ export function selectStrategy(probe: ProbeResult, detection: DetectionResult): 
     transferMethod: buildOnCI ? 'scp' : 'none',
     mirrors: {},
     needsBuildTools,
+    deployTimeoutMinutes: 15,
   };
 
   // Configure mirrors for China
@@ -38,6 +39,17 @@ export function selectStrategy(probe: ProbeResult, detection: DetectionResult): 
     // Even if not in China, if specific repos are blocked, add mirrors
     if (!probe.alpineReachable) strategy.mirrors.alpine = CHINA_MIRRORS.alpine;
     if (!probe.npmReachable) strategy.mirrors.npm = CHINA_MIRRORS.npm;
+  }
+
+  // Bump deploy timeout when we expect slower pulls or longer rebuilds:
+  //   - China mirrors (proxy adds latency, docker compose pulls via 1panel/rat can take minutes)
+  //   - Resource-constrained server (native module compilation during `docker compose up`
+  //     on 1-2GB/1-core boxes regularly exceeds 15min)
+  const constrained =
+    (probe.memoryMB > 0 && probe.memoryMB < 2048) ||
+    (probe.cpuCores > 0 && probe.cpuCores < 2);
+  if (probe.needsChinaMirrors || constrained) {
+    strategy.deployTimeoutMinutes = 25;
   }
 
   // Log the decision
@@ -60,6 +72,18 @@ export function selectStrategy(probe: ProbeResult, detection: DetectionResult): 
   if (Object.keys(strategy.mirrors).length > 0) {
     console.log(chalk.gray(`  镜像源: ${JSON.stringify(strategy.mirrors)}`));
   }
+
+  console.log(
+    chalk.gray(
+      `  CI deploy timeout: ${strategy.deployTimeoutMinutes}min` +
+        (strategy.deployTimeoutMinutes === 25
+          ? ' (提升：' +
+            (probe.needsChinaMirrors ? '中国镜像拉取延迟 ' : '') +
+            (constrained ? `资源受限 ${probe.memoryMB}MB/${probe.cpuCores}core` : '') +
+            ')'
+          : ''),
+    ),
+  );
 
   return strategy;
 }

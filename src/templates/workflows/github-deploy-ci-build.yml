@@ -77,7 +77,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 15m
+          command_timeout: {{DEPLOY_TIMEOUT}}
           script: |
             set -e
             cd {{DEPLOY_DIR}}/{{APP_NAME}}

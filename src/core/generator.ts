@@ -12,6 +12,32 @@ interface GeneratedFile {
 export function generateFiles(config: CollectedConfig, outputDir: string): GeneratedFile[] {
   const generated: GeneratedFile[] = [];
 
+  // 校验必填字段
+  const missingFields: string[] = [];
+  if (!config.project) missingFields.push('project (object)');
+  if (!config.server) missingFields.push('server (object: host, user, sshKeyPath, deployDir)');
+  if (!config.domain) missingFields.push('domain (object: enabled, name, https)');
+  if (!config.branches) missingFields.push('branches (object: production, staging)');
+  if (missingFields.length > 0) {
+    throw new Error(
+      `配置文件缺少必填字段，请检查 -c 传入的 config.json：\n` +
+      missingFields.map(f => `  - ${f}`).join('\n')
+    );
+  }
+
+  // database 字段不存在时自动填充默认值（纯静态项目可不配置数据库）
+  if (!config.database) {
+    config.database = {
+      type: 'none',
+      location: 'none',
+      dataDir: '',
+      initCmd: '',
+      migrateCmd: '',
+      createAdmin: false,
+      adminCmd: '',
+    };
+  }
+
   // Check if this is proxy-service with existing-compose mode
   const isProxyService = config.project.type === 'proxy-service';
   const isExistingCompose = config.deploymentMode === 'existing-compose';
@@ -111,6 +137,7 @@ function buildTemplateVars(config: CollectedConfig, skipDockerFiles: boolean = f
   return {
     APP_NAME: config.project.name,
     APP_PORT: String(config.project.port),
+    CONTAINER_PORT: ['vue-spa', 'react-spa'].includes(config.project.type) ? '80' : String(config.project.port),
     BUILD_CMD: config.project.buildCmd,
     START_CMD: config.project.startCmd,
     START_CMD_DOCKER: dockerCmd,
@@ -155,6 +182,10 @@ function buildTemplateVars(config: CollectedConfig, skipDockerFiles: boolean = f
 
     // Native module build tools
     NEEDS_BUILD_TOOLS: config.strategy?.needsBuildTools ? 'true' : '',
+
+    // Deploy timeout — dynamic based on probe (15min default, 25min for
+    // China mirrors or resource-constrained servers)
+    DEPLOY_TIMEOUT: `${config.strategy?.deployTimeoutMinutes ?? 15}m`,
   };
 }
 

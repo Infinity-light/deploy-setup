@@ -51,7 +51,7 @@ else
 fi
 
 # ─── Step 1.5: Docker 镜像源 ───
-MIRROR_DOCKER="{{MIRROR_DOCKER}}"
+MIRROR_DOCKER='{{MIRROR_DOCKER}}'
 if [ -n "${MIRROR_DOCKER}" ]; then
     step "1.5/7 配置 Docker 镜像源"
     mkdir -p /etc/docker

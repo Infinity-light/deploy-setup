@@ -119,6 +119,14 @@ export interface DeployStrategy {
     docker?: string[];
   };
   needsBuildTools: boolean;
+  /**
+   * command_timeout for the deploy step in CI workflow.
+   * Calculated from probe results: 15min default, 25min when China mirrors
+   * are needed (npm/alpine/docker fetches are slow through proxies) or when
+   * the server is resource-constrained (<2GB RAM or <2 CPU cores, where
+   * docker compose up can stall on native module compilation).
+   */
+  deployTimeoutMinutes: number;
 }
 
 export interface GlobalConfig {
@@ -192,7 +200,7 @@ export const FRAMEWORK_PROFILES: Record<ProjectType, FrameworkProfile> = {
     dbInitCmd: '',
     dbMigrateCmd: '',
     ormTool: 'none',
-    defaultPort: 80,
+    defaultPort: 8080,
     startCmd: '',
     buildCmd: 'npm run build',
     entryFile: 'src/main.ts',
@@ -202,7 +210,7 @@ export const FRAMEWORK_PROFILES: Record<ProjectType, FrameworkProfile> = {
     dbInitCmd: '',
     dbMigrateCmd: '',
     ormTool: 'none',
-    defaultPort: 80,
+    defaultPort: 8080,
     startCmd: '',
     buildCmd: 'npm run build',
     entryFile: 'src/index.tsx',

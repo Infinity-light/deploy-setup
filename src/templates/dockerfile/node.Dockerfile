@@ -9,7 +9,7 @@ RUN sed -i 's/dl-cdn.alpinelinux.org/{{MIRROR_ALPINE}}/g' /etc/apk/repositories
 RUN echo "registry=https://{{MIRROR_NPM}}" > /root/.npmrc
 {{/IF}}
 
-COPY package*.json ./
+COPY package*.json .npmrc* ./
 {{#IF NEEDS_BUILD_TOOLS}}
 RUN apk add --no-cache python3 make g++
 {{/IF}}

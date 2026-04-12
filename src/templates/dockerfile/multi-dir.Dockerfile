@@ -10,7 +10,7 @@ RUN echo "registry=https://{{MIRROR_NPM}}" > /root/.npmrc
 {{/IF}}
 
 # Copy all package.json files
-COPY package*.json ./
+COPY package*.json .npmrc* ./
 COPY {{SERVER_DIR}}/package*.json ./{{SERVER_DIR}}/
 COPY {{CLIENT_DIR}}/package*.json ./{{CLIENT_DIR}}/
 
