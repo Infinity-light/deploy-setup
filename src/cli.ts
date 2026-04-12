@@ -13,6 +13,7 @@ import { saveProjectRecord } from './utils/config-store';
 import { saveCache, loadCache, saveDeployConfig } from './utils/cache';
 import { CollectedConfig } from './core/types';
 import { diffEnvKeys, patchDeployYml } from './core/env-sync';
+import { acquireServerLock } from './utils/deploy-lock';
 
 const program = new Command();
 
@@ -267,6 +268,22 @@ async function runSetupServer(projectDir: string): Promise<void> {
   console.log(chalk.cyan(`\n🖥  连接服务器: ${user}@${host}\n`));
   console.log(chalk.gray(`  使用密钥: ${resolvedKeyPath}`));
 
+  // Acquire a server-side atomic lock so two concurrent `deploy-setup`
+  // invocations (from parallel agents or different machines) can't race
+  // during setup-server. The GH Actions workflow separately handles the
+  // actual deploy stage's concurrency; this lock only covers the CLI's
+  // remote init phase.
+  const lockHolder = `${os.userInfo().username}@${os.hostname()} (deploy-setup pid=${process.pid})`;
+  const lock = acquireServerLock({
+    host,
+    user,
+    sshKeyPath: resolvedKeyPath,
+    projectName: config.project.name || 'default',
+    holderHint: lockHolder,
+    staleSeconds: 1800,
+  });
+  console.log(chalk.gray(`  🔒 已获取服务器部署锁 (/tmp/deploy-setup-lock-${config.project.name || 'default'})`));
+
   const keyArg = fs.existsSync(resolvedKeyPath) ? `-i "${resolvedKeyPath}"` : '';
   // Convert CRLF to LF for Linux compatibility and write to ASCII temp path to avoid cmd.exe issues with non-ASCII paths
   const scriptContent = fs.readFileSync(scriptPath, 'utf-8').replace(/\r\n/g, '\n');
@@ -279,6 +296,12 @@ async function runSetupServer(projectDir: string): Promise<void> {
     console.log(chalk.green('  ✔ 服务器初始化完成'));
   } finally {
     if (fs.existsSync(lfScriptPath)) fs.unlinkSync(lfScriptPath);
+    try {
+      lock.release();
+      console.log(chalk.gray('  🔓 已释放服务器部署锁'));
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ 释放锁失败（仍会继续）: ${err.message}`));
+    }
   }
 }
 

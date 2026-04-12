@@ -5,6 +5,15 @@ on:
     branches:
       - {{BRANCH_PRODUCTION}}
 
+# Serialize deployments targeting the same server — prevents two
+# concurrent runs from racing on the remote machine when multiple
+# agents/branches push in quick succession. Does NOT cancel mid-flight
+# (cancel-in-progress: false) because aborting a deploy mid-way can
+# leave the server in an inconsistent state; we queue instead.
+concurrency:
+  group: deploy-{{APP_NAME}}-${{ secrets.SERVER_HOST }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,7 +32,7 @@ jobs:
 
       - name: Smoke test
         run: |
-          docker run -d --name smoke-test -p {{APP_PORT}}:{{APP_PORT}} {{APP_NAME}}:${{ github.sha }}
+          docker run -d --name smoke-test -p {{APP_PORT}}:{{CONTAINER_PORT}} {{APP_NAME}}:${{ github.sha }}
           echo "Waiting for container to start..."
           sleep 8
           for i in 1 2 3 4 5; do
@@ -43,8 +52,8 @@ jobs:
 
       - name: Package image
         run: |
-          docker save {{APP_NAME}}:${{ github.sha }} | gzip > /tmp/image.tar.gz
-          ls -lh /tmp/image.tar.gz
+          docker save {{APP_NAME}}:${{ github.sha }} | gzip > image.tar.gz
+          ls -lh image.tar.gz
 
       - name: Transfer image to server
         uses: appleboy/scp-action@v0.1.7
@@ -52,9 +61,8 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "/tmp/image.tar.gz"
+          source: "image.tar.gz"
           target: "/tmp"
-          strip_components: 2
 
   deploy:
     needs: build

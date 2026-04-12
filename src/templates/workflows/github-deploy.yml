@@ -5,6 +5,15 @@ on:
     branches:
       - {{BRANCH_PRODUCTION}}
 
+# Serialize deployments targeting the same server — prevents two
+# concurrent runs from racing on the remote machine when multiple
+# agents/branches push in quick succession. cancel-in-progress: false
+# so we queue rather than abort (aborting mid-deploy risks inconsistent
+# server state).
+concurrency:
+  group: deploy-{{APP_NAME}}-${{ secrets.SERVER_HOST }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
