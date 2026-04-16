@@ -1,8 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import chalk from 'chalk';
-import { CollectedConfig } from './types';
+import { CollectedConfig, Scenario } from './types';
 import { replacePlaceholders, readTemplate } from '../utils/template';
+import { pushProxyWorkflows } from './proxy-repo';
 
 interface GeneratedFile {
   path: string;
@@ -69,17 +70,41 @@ export function generateFiles(config: CollectedConfig, outputDir: string): Gener
     ));
   }
 
-  // GitHub Actions workflow - choose template based on strategy
+  // GitHub Actions workflows
   const workflowDir = path.join(outputDir, '.github', 'workflows');
   fs.mkdirSync(workflowDir, { recursive: true });
-  const workflowTemplate = config.strategy?.buildLocation === 'ci'
-    ? 'github-deploy-ci-build.yml'
-    : 'github-deploy.yml';
-  generated.push(writeTemplate(
-    readTemplate('workflows', workflowTemplate),
-    '.github/workflows/deploy.yml',
-    vars, outputDir
-  ));
+
+  if (config.proxyRepo?.enabled) {
+    // Proxy mode: generate trigger workflows locally
+    generated.push(writeTemplate(
+      readTemplate('workflows', 'proxy-trigger-deploy.yml'),
+      '.github/workflows/deploy.yml',
+      vars, outputDir
+    ));
+    generated.push(writeTemplate(
+      readTemplate('workflows', 'proxy-trigger-release.yml'),
+      '.github/workflows/release.yml',
+      vars, outputDir
+    ));
+
+    // Push actual workflows to proxy repo
+    try {
+      generateProxyWorkflows(config, vars);
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ Proxy workflow 推送失败: ${err.message}`));
+      console.log(chalk.yellow('  后续可手动运行: deploy-setup init 重试'));
+    }
+  } else {
+    // Legacy mode: generate deploy workflow locally
+    const workflowTemplate = config.strategy?.buildLocation === 'ci'
+      ? 'github-deploy-ci-build.yml'
+      : 'github-deploy.yml';
+    generated.push(writeTemplate(
+      readTemplate('workflows', workflowTemplate),
+      '.github/workflows/deploy.yml',
+      vars, outputDir
+    ));
+  }
 
   // Nginx config for SPA
   if (['vue-spa', 'react-spa'].includes(config.project.type)) {
@@ -113,6 +138,37 @@ export function generateFiles(config: CollectedConfig, outputDir: string): Gener
   }
 
   return generated;
+}
+
+/**
+ * Generate and push proxy repo workflows based on detected scenario.
+ */
+function generateProxyWorkflows(config: CollectedConfig, vars: Record<string, string>): void {
+  if (!config.proxyRepo?.enabled) return;
+
+  const scenario: Scenario = config.scenario || 'simple-web';
+  const workflows: Array<{ path: string; content: string }> = [];
+
+  if (scenario === 'monorepo-node' || scenario === 'simple-web') {
+    const template = readTemplate('workflows', 'proxy-monorepo-node.yml');
+    const content = replacePlaceholders(template, vars);
+    workflows.push({ path: '.github/workflows/deploy.yml', content });
+  }
+
+  if (scenario === 'tauri-desktop') {
+    const template = readTemplate('workflows', 'proxy-tauri-desktop.yml');
+    const content = replacePlaceholders(template, vars);
+    workflows.push({ path: '.github/workflows/release.yml', content });
+
+    // Tauri projects may also have a deploy workflow for server components
+    if (config.server?.host) {
+      const deployTemplate = readTemplate('workflows', 'proxy-monorepo-node.yml');
+      const deployContent = replacePlaceholders(deployTemplate, vars);
+      workflows.push({ path: '.github/workflows/deploy.yml', content: deployContent });
+    }
+  }
+
+  pushProxyWorkflows(config.proxyRepo, workflows);
 }
 
 function buildTemplateVars(config: CollectedConfig, skipDockerFiles: boolean = false): Record<string, string> {
@@ -186,6 +242,27 @@ function buildTemplateVars(config: CollectedConfig, skipDockerFiles: boolean = f
     // Deploy timeout — dynamic based on probe (15min default, 25min for
     // China mirrors or resource-constrained servers)
     DEPLOY_TIMEOUT: `${config.strategy?.deployTimeoutMinutes ?? 15}m`,
+    DEPLOY_TIMEOUT_MINUTES: String(config.strategy?.deployTimeoutMinutes ?? 20),
+
+    // Proxy repo vars
+    PROXY_REPO_OWNER: config.proxyRepo?.owner || '',
+    PROXY_REPO_NAME: config.proxyRepo?.repo || '',
+    CHECKOUT_TOKEN_SECRET: config.proxyRepo?.checkoutTokenSecret || 'GH_RELEASE_REPO_TOKEN',
+    SCENARIO: config.scenario || 'simple-web',
+
+    // Monorepo proxy vars
+    COMPOSE_FILE: 'docker-compose.prod.yml',
+    SERVER_BUILD_CMD: config.project.buildCmd ? `pnpm --filter server build` : '',
+    ADMIN_BUILD_CMD: '',
+    ENV_PROXY_SECRET_ENV_BLOCK: config.secrets
+      .map(key => `          ${key}: \${{ secrets.${key} }}`)
+      .join('\n'),
+    ENV_PROXY_WRITE_BLOCK: [
+      ...Object.entries(config.envVars || {}).map(([k, v]) => `          echo "${k}=${v}" >> .env`),
+      ...config.secrets.map(key => `          echo "${key}=\${${key}}" >> .env`),
+    ].join('\n'),
+    HEALTH_PATH: '',
+    NGINX_SYNC_CMD: '',
   };
 }
 

@@ -14,6 +14,23 @@ export type Language = 'python' | 'node';
 export type DbType = 'sqlite' | 'postgres' | 'mysql' | 'none';
 export type OrmTool = 'alembic' | 'django-migrations' | 'prisma' | 'typeorm' | 'none';
 
+export type Scenario = 'simple-web' | 'monorepo-node' | 'tauri-desktop';
+
+export interface ProxyRepoConfig {
+  enabled: boolean;
+  owner: string;
+  repo: string;
+  eventType: string;
+  checkoutTokenSecret: string;
+}
+
+// Exit codes for structured CLI output
+export const EXIT_SUCCESS = 0;
+export const EXIT_CONFIG_ERROR = 1;
+export const EXIT_NETWORK_ERROR = 2;
+export const EXIT_SECRET_MISSING = 3;
+export const EXIT_PROXY_REPO_FAILED = 4;
+
 export interface FrameworkProfile {
   dataDir: string;
   dbInitCmd: string;
@@ -44,6 +61,7 @@ export interface DetectionResult {
   projectStructure: 'standard' | 'multi-dir';
   subDirs: { server?: string; client?: string };
   nativeModules: string[];
+  scenario?: Scenario;
 }
 
 export interface ServerConfig {
@@ -85,6 +103,10 @@ export interface CollectedConfig {
 
   strategy?: DeployStrategy;
 
+  proxyRepo?: ProxyRepoConfig;
+  scenario?: Scenario;
+  servers?: ServerConfig[];
+
   database: {
     type: DbType;
     location: 'host' | 'container' | 'external' | 'none';
@@ -106,6 +128,7 @@ export interface ProbeResult {
   npmReachable: boolean;
   alpineReachable: boolean;
   geoCountry: string;
+  githubApiReachable: boolean;
   needsChinaMirrors: boolean;
 }
 

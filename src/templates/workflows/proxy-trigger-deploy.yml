@@ -1,0 +1,22 @@
+name: Trigger Deploy
+
+on:
+  push:
+    branches:
+      - {{BRANCH_PRODUCTION}}
+    paths-ignore:
+      - '**.md'
+      - '.workflow/**'
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger proxy repo deploy
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.{{CHECKOUT_TOKEN_SECRET}} }}
+          repository: {{PROXY_REPO_OWNER}}/{{PROXY_REPO_NAME}}
+          event-type: deploy
+          client-payload: '{"ref": "${{ github.sha }}", "branch": "${{ github.ref_name }}", "repo": "${{ github.repository }}"}'

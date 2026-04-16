@@ -1,0 +1,105 @@
+name: Release Desktop
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag ref to build (e.g. v0.2.0)'
+        required: true
+      repo:
+        description: 'Source repo (owner/name)'
+        required: true
+
+concurrency:
+  group: release-{{APP_NAME}}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.inputs.outputs.ref }}
+      repo: ${{ steps.inputs.outputs.repo }}
+      tag: ${{ steps.inputs.outputs.tag }}
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.client_payload.repo }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ github.event.client_payload.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.inputs.repo }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+          fi
+
+  build-macos:
+    needs: resolve
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64-apple-darwin
+            label: arm64
+            runner: [self-hosted, macOS, ARM64]
+          - arch: x86_64-apple-darwin
+            label: x64
+            runner: [self-hosted, macOS, ARM64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve.outputs.repo }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.{{CHECKOUT_TOKEN_SECRET}} }}
+
+      - name: Setup build environment
+        run: |
+          rustup target add ${{ matrix.arch }}
+
+      - name: Install frontend dependencies
+        run: |
+          cd apps/desktop
+          pnpm install --frozen-lockfile
+
+      - name: Build Tauri app
+        run: |
+          cd apps/desktop
+          pnpm tauri build --target ${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.label }}
+          path: |
+            apps/desktop/src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.dmg
+          retention-days: 7
+
+  create-release:
+    needs: [resolve, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
