@@ -11,10 +11,12 @@ import { probeServer } from './core/prober';
 import { selectStrategy } from './core/strategy';
 import { saveProjectRecord } from './utils/config-store';
 import { saveCache, loadCache, saveDeployConfig } from './utils/cache';
-import { CollectedConfig } from './core/types';
+import { CollectedConfig, EXIT_CONFIG_ERROR, EXIT_NETWORK_ERROR, EXIT_PROXY_REPO_FAILED } from './core/types';
 import { diffEnvKeys, patchDeployYml } from './core/env-sync';
 import { acquireServerLock } from './utils/deploy-lock';
 import { redeployProject } from './core/redeployer';
+import { deriveProxyRepoConfig } from './core/strategy';
+import { redirectConsoleToStderr, emitJsonSuccess, emitJsonError } from './utils/json-output';
 
 const program = new Command();
 
@@ -31,13 +33,17 @@ program
   .option('-c, --config <file>', '使用 JSON 配置文件（跳过交互）')
   .option('-k, --key <path>', 'SSH 私钥文件路径')
   .option('-e, --env-file <path>', '从文件读取密钥值（跳过交互输入）')
+  .option('--unattended', '非交互模式（需配合 -c 使用）')
+  .option('--json', '结构化 JSON 输出（stdout = JSON，stderr = 日志）')
+  .option('--legacy', '使用传统模式（不走 proxy repo）')
   .action(async (options) => {
+    if (options.json) redirectConsoleToStderr();
     const projectDir = path.resolve(options.dir);
 
     console.log(chalk.cyan.bold('\n🚀 deploy-setup - 一键部署\n'));
 
     // Step 1: init
-    const config = await runInit(projectDir, options.config);
+    const config = await runInit(projectDir, options.config, { legacy: options.legacy, json: options.json });
 
     // Step 2: check-dns (non-blocking)
     await runCheckDns(projectDir);
@@ -48,8 +54,10 @@ program
     // Step 4: setup-secrets
     await runSetupSecrets(projectDir, options.key, options.envFile);
 
-    // Step 5: git push
-    await runPushAndVerify(projectDir, config.branches.production);
+    // Step 5: git push (skip in unattended mode)
+    if (!options.unattended) {
+      await runPushAndVerify(projectDir, config.branches.production);
+    }
 
     console.log(chalk.green.bold('\n✅ 部署完成! 后续 git push 即自动部署。\n'));
   });
@@ -60,11 +68,34 @@ program
   .description('初始化 CI/CD 配置（交互式）')
   .option('-d, --dir <dir>', '项目目录', process.cwd())
   .option('-c, --config <file>', '使用 JSON 配置文件（跳过交互）')
+  .option('--unattended', '非交互模式（需配合 -c 使用）')
+  .option('--json', '结构化 JSON 输出（stdout = JSON，stderr = 日志）')
+  .option('--legacy', '使用传统模式（不走 proxy repo）')
   .action(async (options) => {
+    if (options.json) redirectConsoleToStderr();
     const projectDir = path.resolve(options.dir);
     console.log(chalk.cyan.bold('\n🚀 deploy-setup - CI/CD 配置生成器\n'));
-    const config = await runInit(projectDir, options.config);
-    printNextSteps(config);
+    const config = await runInit(projectDir, options.config, { legacy: options.legacy, json: options.json });
+
+    if (options.json) {
+      const proxyRepo = config.proxyRepo;
+      emitJsonSuccess({
+        proxyRepo: proxyRepo?.enabled ? {
+          owner: proxyRepo.owner,
+          repo: proxyRepo.repo,
+          created: false,
+          workflowUpdated: false,
+          workflows: [],
+        } : undefined,
+        nextStep: 'push-and-verify',
+        secretsRequired: [
+          ...(proxyRepo?.enabled ? [proxyRepo.checkoutTokenSecret] : []),
+          'SERVER_HOST', 'SERVER_USER', 'SSH_PRIVATE_KEY',
+        ],
+      });
+    } else {
+      printNextSteps(config);
+    }
   });
 
 // ─── check-dns ───
@@ -192,7 +223,12 @@ program.parse(process.argv);
 
 // ─── core functions ───
 
-async function runInit(projectDir: string, configFile?: string): Promise<CollectedConfig> {
+interface InitOptions {
+  legacy?: boolean;
+  json?: boolean;
+}
+
+async function runInit(projectDir: string, configFile?: string, initOptions?: InitOptions): Promise<CollectedConfig> {
   const projectName = path.basename(projectDir).toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
   const spinner = ora('检测项目类型...').start();
@@ -212,6 +248,41 @@ async function runInit(projectDir: string, configFile?: string): Promise<Collect
     console.log(chalk.green(`  使用配置文件: ${path.resolve(configFile)}`));
   } else {
     config = await collectConfig(detection, projectName);
+  }
+
+  // Derive proxy repo config (default: enabled, unless --legacy)
+  const { execSync: execSyncLocal } = require('child_process');
+  let repoOwner = '';
+  let repoName = '';
+  try {
+    const remoteUrl = execSyncLocal('gh repo view --json owner,name -q ".owner.login + \\" \\" + .name"', {
+      cwd: projectDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    const parts = remoteUrl.split(' ');
+    repoOwner = parts[0] || '';
+    repoName = parts[1] || '';
+  } catch {
+    // Fallback: parse from git remote
+    try {
+      const remote = execSyncLocal('git remote get-url origin', {
+        cwd: projectDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+      const match = remote.match(/[/:]([^/]+)\/([^/.]+?)(?:\.git)?$/);
+      if (match) {
+        repoOwner = match[1];
+        repoName = match[2];
+      }
+    } catch { /* no git remote */ }
+  }
+
+  config.proxyRepo = deriveProxyRepoConfig({
+    legacy: initOptions?.legacy,
+    repoOwner,
+    repoName,
+  });
+
+  if (config.proxyRepo.enabled) {
+    console.log(chalk.cyan(`\n🔀 Proxy Repo 模式: ${config.proxyRepo.owner}/${config.proxyRepo.repo}`));
   }
 
   // Probe server and select strategy (if server config is available)
@@ -363,7 +434,19 @@ async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath
     }
   }
 
-  console.log(chalk.cyan('\n🔑 配置 GitHub Secrets\n'));
+  // Determine target repo for secrets
+  const proxyEnabled = config.proxyRepo?.enabled;
+  const targetRepo = proxyEnabled
+    ? `${config.proxyRepo!.owner}/${config.proxyRepo!.repo}`
+    : undefined;
+
+  if (proxyEnabled) {
+    console.log(chalk.cyan(`\n🔑 配置 GitHub Secrets → ${targetRepo}\n`));
+  } else {
+    console.log(chalk.cyan('\n🔑 配置 GitHub Secrets\n'));
+  }
+
+  const repoFlag = targetRepo ? `--repo ${targetRepo}` : '';
 
   const secrets: Record<string, string> = {
     SERVER_HOST: config.server.host,
@@ -390,7 +473,7 @@ async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath
 
   for (const [name, value] of Object.entries(secrets)) {
     try {
-      execSync(`gh secret set ${name}`, {
+      execSync(`gh secret set ${name} ${repoFlag}`, {
         input: value, cwd: projectDir,
         stdio: ['pipe', 'ignore', 'pipe'],
       });
@@ -398,6 +481,14 @@ async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath
     } catch (err: any) {
       console.log(chalk.red(`  ✗ ${name}: ${err.message}`));
     }
+  }
+
+  // If proxy repo is enabled, also set the checkout token secret on the PROJECT repo
+  // (the trigger workflow needs it to dispatch to the proxy repo)
+  if (proxyEnabled && config.proxyRepo) {
+    const tokenSecretName = config.proxyRepo.checkoutTokenSecret;
+    console.log(chalk.cyan(`\n  ⚠ 还需要在项目仓库设置 ${tokenSecretName} (GitHub PAT with repo scope)`));
+    console.log(chalk.gray(`    gh secret set ${tokenSecretName}  ← 粘贴你的 GitHub PAT`));
   }
 
   // Business secrets from .env (config.secrets)
@@ -413,7 +504,7 @@ async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath
         const value = envFileMap[key];
         if (value) {
           try {
-            execSync(`gh secret set ${key}`, {
+            execSync(`gh secret set ${key} ${repoFlag}`, {
               input: value, cwd: projectDir,
               stdio: ['pipe', 'ignore', 'pipe'],
             });
@@ -443,7 +534,7 @@ async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath
         }
 
         try {
-          execSync(`gh secret set ${key}`, {
+          execSync(`gh secret set ${key} ${repoFlag}`, {
             input: value, cwd: projectDir,
             stdio: ['pipe', 'ignore', 'pipe'],
           });
@@ -460,6 +551,7 @@ async function runSetupSecrets(projectDir: string, keyPath?: string, envFilePath
 
 async function runPushAndVerify(projectDir: string, branch: string): Promise<void> {
   const { execSync } = require('child_process');
+  const config = loadCache(projectDir);
 
   console.log(chalk.cyan(`\n📤 推送到 GitHub (${branch})\n`));
 
@@ -474,13 +566,21 @@ async function runPushAndVerify(projectDir: string, branch: string): Promise<voi
   execSync(`git push origin ${branch}`, { cwd: projectDir, stdio: 'inherit' });
   console.log(chalk.green('  ✔ 已推送'));
 
+  // Determine which repo to monitor for Actions runs
+  const proxyEnabled = config.proxyRepo?.enabled;
+  const monitorRepo = proxyEnabled
+    ? `${config.proxyRepo!.owner}/${config.proxyRepo!.repo}`
+    : undefined;
+  const repoFlag = monitorRepo ? `--repo ${monitorRepo}` : '';
+  const monitorTarget = monitorRepo || '当前仓库';
+
   // Wait for Actions run
-  console.log(chalk.cyan('\n⏳ 等待 GitHub Actions 运行...\n'));
-  await new Promise(r => setTimeout(r, 5000));
+  console.log(chalk.cyan(`\n⏳ 等待 GitHub Actions 运行... (${monitorTarget})\n`));
+  await new Promise(r => setTimeout(r, proxyEnabled ? 10000 : 5000));
 
   for (let i = 0; i < 30; i++) {
     try {
-      const result = execSync('gh run list --limit 1 --json status,conclusion,name', {
+      const result = execSync(`gh run list --limit 1 --json status,conclusion,name ${repoFlag}`, {
         cwd: projectDir, encoding: 'utf-8',
       });
       const runs = JSON.parse(result);
@@ -491,7 +591,7 @@ async function runPushAndVerify(projectDir: string, branch: string): Promise<voi
             console.log(chalk.green(`  ✔ Actions 运行成功: ${run.name}`));
           } else {
             console.log(chalk.red(`  ✗ Actions 运行失败: ${run.name} (${run.conclusion})`));
-            console.log(chalk.yellow('  运行 gh run view --log-failed 查看详情'));
+            console.log(chalk.yellow(`  运行 gh run view --log-failed ${repoFlag} 查看详情`));
           }
           return;
         }
@@ -692,7 +792,14 @@ async function runSyncEnv(projectDir: string, options: { dryRun?: boolean; yes?:
       // Also read from detected .env as fallback
       const detectedEnvMap = detection.envPairs;
 
-      console.log(chalk.cyan('\n🔑 推送新 Secrets 到 GitHub\n'));
+      // Push to proxy repo if enabled
+      const syncRepoFlag = config.proxyRepo?.enabled
+        ? `--repo ${config.proxyRepo.owner}/${config.proxyRepo.repo}`
+        : '';
+      const syncTarget = config.proxyRepo?.enabled
+        ? `${config.proxyRepo.owner}/${config.proxyRepo.repo}`
+        : 'GitHub';
+      console.log(chalk.cyan(`\n🔑 推送新 Secrets 到 ${syncTarget}\n`));
       for (const key of newSecretKeys) {
         const value = envFileMap[key] || detectedEnvMap[key] || '';
         if (!value) {
@@ -700,7 +807,7 @@ async function runSyncEnv(projectDir: string, options: { dryRun?: boolean; yes?:
           continue;
         }
         try {
-          execSync(`gh secret set ${key}`, {
+          execSync(`gh secret set ${key} ${syncRepoFlag}`, {
             input: value, cwd: projectDir,
             stdio: ['pipe', 'ignore', 'pipe'],
           });

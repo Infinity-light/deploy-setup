@@ -1,5 +1,5 @@
 import chalk from 'chalk';
-import { ProbeResult, DeployStrategy, DetectionResult } from './types';
+import { ProbeResult, DeployStrategy, DetectionResult, ProxyRepoConfig } from './types';
 
 const CHINA_MIRRORS = {
   alpine: 'mirrors.aliyun.com',
@@ -7,6 +7,39 @@ const CHINA_MIRRORS = {
   pip: 'mirrors.aliyun.com/pypi/simple',
   docker: ['docker.1panel.live', 'hub.rat.dev'],
 };
+
+export interface StrategyOptions {
+  legacy?: boolean;
+  repoOwner?: string;
+  repoName?: string;
+}
+
+/**
+ * Derive proxy repo config.
+ * Default: enabled=true, repo = "{repoName}-releases".
+ * --legacy: enabled=false.
+ */
+export function deriveProxyRepoConfig(options: StrategyOptions): ProxyRepoConfig {
+  if (options.legacy) {
+    return {
+      enabled: false,
+      owner: '',
+      repo: '',
+      eventType: '',
+      checkoutTokenSecret: '',
+    };
+  }
+
+  const owner = options.repoOwner || '';
+  const baseRepo = options.repoName || '';
+  return {
+    enabled: true,
+    owner,
+    repo: `${baseRepo}-releases`,
+    eventType: 'deploy',
+    checkoutTokenSecret: 'GH_RELEASE_REPO_TOKEN',
+  };
+}
 
 /**
  * Based on server probe results and project detection,

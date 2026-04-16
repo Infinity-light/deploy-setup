@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { DetectionResult, ProjectType, Language, FRAMEWORK_PROFILES, OrmTool, DbType } from './types';
+import { DetectionResult, ProjectType, Language, FRAMEWORK_PROFILES, OrmTool, DbType, Scenario } from './types';
 
 const KNOWN_NATIVE_MODULES = [
   'better-sqlite3', 'sqlite3', 'bcrypt', 'sharp', 'canvas',
@@ -88,6 +88,9 @@ export function detectProject(rootDir: string): DetectionResult {
 
   // Detect native modules
   result.nativeModules = detectNativeModules(rootDir, result.language, result.projectStructure, result.subDirs);
+
+  // Detect deployment scenario
+  result.scenario = detectScenario(rootDir);
 
   // Detect database type from .env
   if (result.envFile) {
@@ -195,6 +198,36 @@ function parseEnvPairs(envFilePath: string): { keys: string[]; pairs: Record<str
     pairs[key] = value;
   }
   return { keys, pairs };
+}
+
+/**
+ * Detect the deployment scenario based on project file structure.
+ * - tauri-desktop: has src-tauri/Cargo.toml + tauri.conf.json
+ * - monorepo-node: has pnpm-workspace.yaml + apps/server + apps/admin (or apps/ with multiple packages)
+ * - simple-web: fallback
+ */
+export function detectScenario(rootDir: string): Scenario {
+  // Check for Tauri project
+  const hasTauriCargo = fs.existsSync(path.join(rootDir, 'src-tauri', 'Cargo.toml'));
+  const hasTauriConf = fs.existsSync(path.join(rootDir, 'src-tauri', 'tauri.conf.json'));
+  // Also check nested: apps/desktop/src-tauri (common monorepo layout)
+  const hasNestedTauriCargo = fs.existsSync(path.join(rootDir, 'apps', 'desktop', 'src-tauri', 'Cargo.toml'));
+  const hasNestedTauriConf = fs.existsSync(path.join(rootDir, 'apps', 'desktop', 'src-tauri', 'tauri.conf.json'));
+
+  if ((hasTauriCargo && hasTauriConf) || (hasNestedTauriCargo && hasNestedTauriConf)) {
+    return 'tauri-desktop';
+  }
+
+  // Check for monorepo-node
+  const hasPnpmWorkspace = fs.existsSync(path.join(rootDir, 'pnpm-workspace.yaml'));
+  const hasAppsServer = fs.existsSync(path.join(rootDir, 'apps', 'server'));
+  const hasAppsAdmin = fs.existsSync(path.join(rootDir, 'apps', 'admin'));
+
+  if (hasPnpmWorkspace && hasAppsServer && hasAppsAdmin) {
+    return 'monorepo-node';
+  }
+
+  return 'simple-web';
 }
 
 function detectNativeModules(

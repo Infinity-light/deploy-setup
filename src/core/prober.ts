@@ -4,6 +4,22 @@ import * as os from 'os';
 import { ServerConfig, ProbeResult } from './types';
 
 /**
+ * Check if GitHub API is reachable from the local machine.
+ * Used to decide whether proxy repo mode is viable.
+ */
+export function probeGitHubApi(): boolean {
+  try {
+    execSync('curl -sSL --connect-timeout 5 https://api.github.com', {
+      stdio: 'ignore',
+      timeout: 10000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * SSH to the server and probe its capabilities.
  * Returns a ProbeResult describing hardware, software, and network conditions.
  */
@@ -31,6 +47,8 @@ export function probeServer(server: ServerConfig): ProbeResult {
     curl -s --connect-timeout 5 https://dl-cdn.alpinelinux.org/alpine/ &>/dev/null && echo "reachable" || echo "blocked"
     echo "===GEO==="
     curl -s --connect-timeout 5 ipinfo.io/country 2>/dev/null || echo "UNKNOWN"
+    echo "===GITHUBAPI==="
+    curl -s --connect-timeout 5 https://api.github.com &>/dev/null && echo "reachable" || echo "blocked"
   `.trim();
 
   let output: string;
@@ -56,6 +74,7 @@ export function probeServer(server: ServerConfig): ProbeResult {
       npmReachable: false,
       alpineReachable: false,
       geoCountry: 'UNKNOWN',
+      githubApiReachable: false,
       needsChinaMirrors: false,
     };
   }
@@ -78,6 +97,7 @@ export function probeServer(server: ServerConfig): ProbeResult {
     npmReachable: getSection('NPM') === 'reachable',
     alpineReachable: getSection('ALPINE') === 'reachable',
     geoCountry: geo,
+    githubApiReachable: getSection('GITHUBAPI') === 'reachable',
     needsChinaMirrors: geo === 'CN' || (!getSection('DOCKERHUB').includes('reachable') && !getSection('NPM').includes('reachable')),
   };
 }
